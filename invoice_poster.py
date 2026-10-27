@@ -27,6 +27,8 @@ import logging
 import re
 from decimal import Decimal
 
+import requests
+
 import uat_config as cfg
 from bc_http import BcError, bc_get, bc_request
 
@@ -446,6 +448,47 @@ def set_posting_description(bc_guid, invoice_id, step, description) -> None:
          f"{cfg.POSTING_DESC_FIELD} = {description!r}")
 
 
+def fetch_invoice_pdf(record_id) -> bytes:
+    """Invoice file from the ContinuFlow API: login -> signed URL -> file."""
+    login = requests.post(cfg.CF_API_LOGIN_URL, timeout=60, json={
+        "loginBody": {"Source": "password",
+                      "UserName": cfg.CF_API_USERNAME,
+                      "Password": cfg.CF_API_PASSWORD}})
+    login.raise_for_status()
+    body = login.json()
+    token = (body.get("token") or body.get("accessToken")
+             or (body.get("data") or {}).get("token"))
+
+    r = requests.get(cfg.CF_API_FILE_URL.format(record_id=record_id),
+                     headers={"Authorization": f"Bearer {token}"}, timeout=60)
+    r.raise_for_status()
+    body = r.json()
+    signed_url = body if isinstance(body, str) else body.get("data")
+
+    file = requests.get(signed_url, timeout=60)
+    file.raise_for_status()
+    return file.content
+
+
+def attach_invoice_pdf(bc_guid, invoice_id, record_id, step) -> None:
+    """Attach the invoice PDF to the BC purchase invoice (once)."""
+    base = f"{cfg.BC_API_BASE}/companies({bc_guid})/documentAttachments"
+    existing = bc_get(f"{base}?$filter=parentId eq {invoice_id}",
+                      timeout=cfg.BC_HTTP_TIMEOUT) or {}
+    if existing.get("value"):
+        step("attachment", "skipped", "already attached")
+        return
+
+    content = fetch_invoice_pdf(record_id)
+    att = bc_request("POST", base, timeout=cfg.BC_HTTP_TIMEOUT, json_body={
+        "fileName": f"{record_id}.pdf",
+        "parentType": "Purchase_x0020_Invoice",
+        "parentId": invoice_id})
+    bc_request("PATCH", f"{base}({att['id']})/attachmentContent",
+               data=content, etag="*", timeout=cfg.BC_HTTP_TIMEOUT)
+    step("attachment", "ok", f"{record_id}.pdf, {len(content)} bytes")
+
+
 def posting_description(header: dict) -> str:
     """DESCRIPTION from the invoice header, max 100 chars (BC's field size).
     Mandatory for posting in BC, so an empty one holds the record before
@@ -592,6 +635,9 @@ def process_record(conn, dc: dict) -> dict:
                         raise Held(
                             f"dimension {code} = {value} rejected by BC: "
                             f"{e.body or e}")
+
+        # ---- invoice PDF (NEW - ContinuFlow file API) --------------------
+        attach_invoice_pdf(bc_guid, invoice_id, record_id, step)
 
         # ---- posting description (NEW - client's custom API) ------------
         set_posting_description(bc_guid, invoice_id, step, post_desc)
@@ -794,6 +840,9 @@ def process_po_record(conn, dc: dict) -> dict:
 
         # ---- lines + dimensions -----------------------------------------
         add_po_lines(bc_guid, invoice_id, header, lines, step)
+
+        # ---- invoice PDF --------------------------------------------------
+        attach_invoice_pdf(bc_guid, invoice_id, record_id, step)
 
         # ---- posting description ----------------------------------------
         set_posting_description(bc_guid, invoice_id, step, post_desc)
