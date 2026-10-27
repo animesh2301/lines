@@ -22,6 +22,7 @@ moment it exists, so a retry resumes the half-built invoice instead of
 creating a second one.
 """
 
+import json
 import logging
 import re
 from decimal import Decimal
@@ -359,31 +360,63 @@ def mark_posted(conn, record_id) -> None:
         cfg.AUDIT_POSTED_CHANGES)
 
 
+def short_error(message: str) -> str:
+    """
+    BC's own error text when the message carries BC's JSON response
+    ("POST https://... -> 400 :: {"error": {"code": ..., "message": ...}}"),
+    otherwise the message as is. The URL alone would fill a 200-char column.
+    """
+    text = str(message or "")
+    if ":: {" in text:
+        prefix, _, body = text.partition(":: ")
+        try:
+            err = json.loads(body).get("error", {})
+            status = prefix.strip().rsplit(" ", 1)[-1]   # e.g. 400
+            msg = err.get("message") or ""
+            if msg:
+                return f"BC {status}: {msg}"
+        except (ValueError, AttributeError):
+            pass
+    return text
+
+
 def mark_error(conn, record_id, message, attempt) -> None:
     """
     Latest error to ERP_ERROR so it shows in the ContinuFlow UI; full history
     stays in bc.InvoicePostLog. ERP_POST goes to the failed marker once the
     attempt cap is reached so the timer stops retrying.
+
+    Never raises: a failure here (e.g. a column too short) is logged and the
+    batch carries on with the next record.
     """
     exhausted = attempt >= cfg.MAX_ATTEMPTS
     new_state = cfg.DC_ERP_POST_FAILED if exhausted \
         else cfg.DC_ERP_POST_PENDING
+    short = short_error(message)
 
-    cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE dbo.AP_DataConversions
-           SET ERP_ERROR = %s, ERP_POST = %s
-         WHERE RECORD_ID = %s
-        """,
-        (f"[attempt {attempt}] {message}"[:4000], new_state, record_id),
-    )
-    conn.commit()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE dbo.AP_DataConversions
+               SET ERP_ERROR = %s, ERP_POST = %s
+             WHERE RECORD_ID = %s
+            """,
+            (f"[attempt {attempt}] {short}"[:cfg.ERP_ERROR_MAX],
+             new_state, record_id),
+        )
+        conn.commit()
+    except Exception:
+        log.exception("Could not write ERP_ERROR for record %s", record_id)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
     # NEW - CF audit trail
     write_audit_trail(
         conn, record_id,
-        cfg.AUDIT_FAILED_COMMENTS.format(message=message),
+        cfg.AUDIT_FAILED_COMMENTS.format(message=short),
         cfg.AUDIT_FAILED_CHANGES
         if new_state != cfg.DC_ERP_POST_PENDING else cfg.AUDIT_RETRY_CHANGES)
     return exhausted
@@ -851,10 +884,21 @@ def run_batch(conn, limit=None, record_id=None) -> dict:
 
     results = []
     for dc in records:
-        if is_po_invoice(dc):
-            results.append(process_po_record(conn, dc))
-        else:
-            results.append(process_record(conn, dc))
+        # One record's failure never stops the others.
+        try:
+            if is_po_invoice(dc):
+                results.append(process_po_record(conn, dc))
+            else:
+                results.append(process_record(conn, dc))
+        except Exception as e:
+            log.exception("Record %s failed outside its own error handling",
+                          dc.get("RECORD_ID"))
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            results.append({"recordId": dc.get("RECORD_ID"),
+                            "status": "error", "error": str(e)[:500]})
 
     return {
         "picked": len(records),
